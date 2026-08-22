@@ -216,9 +216,22 @@ class OcrWorker(QThread):
                         sct_img.height, sct_img.width, 3
                     )
 
-                    small = cv2.resize(img, None, fx=self.ocr_scale, fy=self.ocr_scale, interpolation=cv2.INTER_AREA)
-                    ocr_result, _ = self.ocr_engine(small)
-                    
+                    # --- ACCURACY PIPELINE ---
+                    # Step 1: UPSCALE 2x instead of downscaling — more pixels = better OCR
+                    #         RapidOCR is fast enough on a small lens crop even at 2x
+                    upscaled = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+                    # Step 2: Convert to grayscale and apply CLAHE to boost local contrast
+                    #         This makes faint or anti-aliased Chinese characters crisp
+                    gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY)
+                    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+                    enhanced = clahe.apply(gray)
+
+                    # Step 3: Merge back to 3-channel for RapidOCR
+                    enhanced_3ch = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+
+                    ocr_result, _ = self.ocr_engine(enhanced_3ch)
+
                     inference_time = int((time.time() - start_time) * 1000)
                     self.speed_signal.emit(inference_time)
 
@@ -227,14 +240,21 @@ class OcrWorker(QThread):
 
                     if ocr_result:
                         for points, text, confidence in ocr_result:
+                            # Filter low-confidence OCR results (garbage characters)
+                            if confidence < 0.55:
+                                continue
+
                             original = text.strip()
+                            # Clean up common OCR artifacts before translating
+                            original = original.replace('，', ',').replace('。', '.').strip()
                             if not original or not contains_chinese(original):
                                 continue
 
-                            x_phys = min(p[0] for p in points) / self.ocr_scale
-                            y_phys = min(p[1] for p in points) / self.ocr_scale
-                            x2_phys = max(p[0] for p in points) / self.ocr_scale
-                            y2_phys = max(p[1] for p in points) / self.ocr_scale
+                            # Scale back: upscaled 2x, so divide by 2 to get physical pixels
+                            x_phys = min(p[0] for p in points) / 2.0
+                            y_phys = min(p[1] for p in points) / 2.0
+                            x2_phys = max(p[0] for p in points) / 2.0
+                            y2_phys = max(p[1] for p in points) / 2.0
 
                             abs_x_phys = lens_left + x_phys
                             abs_y_phys = lens_top + y_phys
@@ -302,7 +322,7 @@ class OverlayWindow(QWidget):
         self.ui_timer.timeout.connect(self.on_ui_tick)
         self.ui_timer.start()
 
-        keyboard.add_hotkey('ctrl+t', self.worker.toggle)
+        keyboard.add_hotkey('alt+t', self.worker.toggle)
 
     def initUI(self):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
@@ -625,7 +645,7 @@ class ConsoleWindow(QWidget):
         stats_layout = QVBoxLayout(stats_frame)
         stats_layout.setContentsMargins(15, 12, 15, 12)
         
-        shortcut_lbl = QLabel("💡 <b>Global Shortcut:</b> Press <b>Ctrl + T</b> to toggle anywhere", self)
+        shortcut_lbl = QLabel("💡 <b>Global Shortcut:</b> Press <b>Alt + T</b> to toggle anywhere", self)
         shortcut_lbl.setStyleSheet("color: #00F0FF;")
         stats_layout.addWidget(shortcut_lbl)
         
@@ -678,7 +698,7 @@ class ConsoleWindow(QWidget):
 
     def update_toggle_btn(self, enabled):
         if enabled:
-            self.toggle_btn.setText("LENS ACTIVE (Ctrl+T)")
+            self.toggle_btn.setText("LENS ACTIVE (Alt+T)")
             self.toggle_btn.setProperty("active", "true")
         else:
             self.toggle_btn.setText("ACTIVATE TRANSLATION LENS")
